@@ -1,0 +1,188 @@
+name: Auto Update AUR Package
+
+on:
+  schedule:
+    # 每 4 小时在整点后 20 分触发一次（错开正点高峰，避免调度延迟）
+    - cron: '20 */4 * * *'
+  workflow_dispatch:
+    inputs:
+      force_push_aur:
+        description: 'Force sync current PKGBUILD/.SRCINFO to AUR even without a new upstream release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install git and essential tools
+        run: |
+          pacman -Syu --noconfirm --needed archlinux-keyring
+          pacman -Syu --noconfirm --needed git openssh curl jq pacman-contrib
+
+      - name: Checkout GitHub repository
+        uses: actions/checkout@v7
+
+      - name: Check upstream latest release and musl assets
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FORCE_PUSH_AUR: ${{ inputs.force_push_aur == true }}
+        run: |
+          API_URL="https://api.github.com/repos/MatrixC7/agy-switch-cli/releases/latest"
+          UPSTREAM_VER=""
+          ASSETS_OK="false"
+          MAX_RETRIES=3
+
+          for i in $(seq 1 "$MAX_RETRIES"); do
+            echo "Fetching upstream latest release (attempt $i/$MAX_RETRIES)..."
+            API_RES=$(curl -sSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              "$API_URL" 2>/dev/null || true)
+
+            TAG_NAME=$(echo "$API_RES" | jq -r '.tag_name // empty' 2>/dev/null || true)
+
+            if [[ -n "$TAG_NAME" && "$TAG_NAME" != "null" ]]; then
+              UPSTREAM_VER="${TAG_NAME#v}"
+              HAS_X86=$(echo "$API_RES" | jq -r --arg n "agy-switch-cli-v${UPSTREAM_VER}-x86_64-unknown-linux-musl.tar.gz" 'any(.assets[]?; .name == $n)' 2>/dev/null || echo "false")
+              HAS_ARM=$(echo "$API_RES" | jq -r --arg n "agy-switch-cli-v${UPSTREAM_VER}-aarch64-unknown-linux-musl.tar.gz" 'any(.assets[]?; .name == $n)' 2>/dev/null || echo "false")
+              if [[ "$HAS_X86" == "true" && "$HAS_ARM" == "true" ]]; then
+                ASSETS_OK="true"
+                break
+              fi
+              echo "Release $TAG_NAME found, waiting for both musl assets (x86_64=$HAS_X86, aarch64=$HAS_ARM)."
+            else
+              API_MSG=$(echo "$API_RES" | jq -r '.message // empty' 2>/dev/null || true)
+              if [[ -n "$API_MSG" ]]; then
+                echo "GitHub API message: $API_MSG"
+              fi
+            fi
+
+            if [[ $i -lt $MAX_RETRIES ]]; then
+              sleep 5
+            fi
+          done
+
+          CURRENT_VER=$(grep -oP '^pkgver=\K.*' PKGBUILD)
+          CURRENT_REL=$(grep -oP '^pkgrel=\K.*' PKGBUILD)
+
+          echo "Upstream version: ${UPSTREAM_VER:-<unavailable>} (assets_ok=$ASSETS_OK)"
+          echo "Current version:  ${CURRENT_VER}-${CURRENT_REL}"
+
+          if [[ -n "$UPSTREAM_VER" && "$ASSETS_OK" == "true" && "$UPSTREAM_VER" != "$CURRENT_VER" ]]; then
+            echo "has_update=true" >> "$GITHUB_OUTPUT"
+            echo "should_push_aur=true" >> "$GITHUB_OUTPUT"
+            echo "target_ver=$UPSTREAM_VER" >> "$GITHUB_OUTPUT"
+            echo "target_rel=1" >> "$GITHUB_OUTPUT"
+          elif [[ "$FORCE_PUSH_AUR" == "true" ]]; then
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+            echo "should_push_aur=true" >> "$GITHUB_OUTPUT"
+            echo "target_ver=$CURRENT_VER" >> "$GITHUB_OUTPUT"
+            echo "target_rel=$CURRENT_REL" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+            echo "should_push_aur=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update PKGBUILD, verify package build, and regenerate .SRCINFO
+        if: steps.check.outputs.should_push_aur == 'true'
+        env:
+          HAS_UPDATE: ${{ steps.check.outputs.has_update }}
+          NEW_VER: ${{ steps.check.outputs.target_ver }}
+        run: |
+          if [[ ! $NEW_VER =~ ^[0-9A-Za-z][0-9A-Za-z._+]*$ ]]; then
+            echo "::error::upstream version '$NEW_VER' is not a valid Arch pkgver"
+            exit 1
+          fi
+
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+          runuser -u builder -- env \
+            HAS_UPDATE="$HAS_UPDATE" \
+            NEW_VER="$NEW_VER" \
+            GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+            bash -euo pipefail <<'BUILDER_EOF'
+          BUILD_SB="$(mktemp -d /tmp/agy-aur-ci-build.XXXXXX)"
+          trap 'rm -rf "$BUILD_SB"' EXIT
+          mkdir -p "$BUILD_SB/src" "$BUILD_SB/build" "$BUILD_SB/pkg"
+          export SRCDEST="$BUILD_SB/src"
+          export BUILDDIR="$BUILD_SB/build"
+          export PKGDEST="$BUILD_SB/pkg"
+
+          cd "$GITHUB_WORKSPACE"
+          if [[ "$HAS_UPDATE" == "true" ]]; then
+            sed -i "s|^pkgver=.*|pkgver=${NEW_VER}|" PKGBUILD
+            sed -i "s|^pkgrel=.*|pkgrel=1|" PKGBUILD
+            updpkgsums
+          fi
+
+          makepkg --printsrcinfo > .SRCINFO
+          makepkg -f --noconfirm --nodeps
+          BUILDER_EOF
+
+      - name: Push to AUR
+        if: steps.check.outputs.should_push_aur == 'true'
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_USERNAME: ${{ vars.AUR_USERNAME || 'github-actions[bot]' }}
+          AUR_EMAIL: ${{ vars.AUR_EMAIL || 'github-actions[bot]@users.noreply.github.com' }}
+          TARGET_VER: ${{ steps.check.outputs.target_ver }}
+          TARGET_REL: ${{ steps.check.outputs.target_rel }}
+        run: |
+          if [[ -z "$AUR_SSH_PRIVATE_KEY" ]]; then
+            echo "::error::Missing secrets.AUR_SSH_PRIVATE_KEY"
+            exit 1
+          fi
+
+          mkdir -p /root/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > /root/.ssh/aur
+          chmod 600 /root/.ssh/aur
+          ssh-keyscan -H aur.archlinux.org >> /root/.ssh/known_hosts
+
+          cat <<EOF > /root/.ssh/config
+          Host aur.archlinux.org
+            User aur
+            IdentityFile /root/.ssh/aur
+            StrictHostKeyChecking accept-new
+          EOF
+
+          # 仅克隆并提交 AUR 允许的顶层文件，绝不把 .github/ 推入 AUR
+          git clone ssh://aur@aur.archlinux.org/agy-switch-cli-bin.git /tmp/aur-repo
+          cp PKGBUILD .SRCINFO .gitignore /tmp/aur-repo/
+          cd /tmp/aur-repo
+          git checkout -B master
+          git config user.name "$AUR_USERNAME"
+          git config user.email "$AUR_EMAIL"
+          git add .gitignore PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "AUR repository already up to date."
+          else
+            git commit -m "upgpkg: agy-switch-cli-bin ${TARGET_VER}-${TARGET_REL}"
+            git push origin master
+          fi
+
+      - name: Commit update back to GitHub repository
+        if: steps.check.outputs.has_update == 'true'
+        env:
+          AUR_USERNAME: ${{ vars.AUR_USERNAME || 'github-actions[bot]' }}
+          AUR_EMAIL: ${{ vars.AUR_EMAIL || 'github-actions[bot]@users.noreply.github.com' }}
+          TARGET_VER: ${{ steps.check.outputs.target_ver }}
+          TARGET_REL: ${{ steps.check.outputs.target_rel }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name "$AUR_USERNAME"
+          git config user.email "$AUR_EMAIL"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "GitHub repository already up to date."
+          else
+            git commit -m "upgpkg: agy-switch-cli-bin ${TARGET_VER}-${TARGET_REL}"
+            git push
+          fi
